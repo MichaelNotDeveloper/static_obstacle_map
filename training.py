@@ -129,6 +129,8 @@ def train_batch(
         score = metrics(logits, target, ignore_index=args.ignore_index)
 
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        norm = grad_norm((feature_model, projection_model, mapping_model))
         scaler.step(optimizer)
         scaler.update()
 
@@ -137,6 +139,7 @@ def train_batch(
         progress.set_postfix(
             loss=f"{loss.detach().item():.5f}",
             iou=f"{score.get('iou', 0.0):.5f}",
+            grad_norm=f"{norm:.3f}",
         )
 
     scheduler.step()
@@ -195,6 +198,17 @@ def make_param_group(model, lr):
     if not params:
         return None
     return {"params": params, "lr": lr}
+
+
+def grad_norm(models):
+    total = 0.0
+    for model in models:
+        for param in model.parameters():
+            if param.grad is None:
+                continue
+            norm = param.grad.detach().float().norm(2)
+            total += norm.item() ** 2
+    return total ** 0.5
 
 
 def make_models(args, device):

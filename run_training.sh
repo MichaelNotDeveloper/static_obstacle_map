@@ -5,7 +5,7 @@ python3 training.py \
   --pixel_step 8 \
   --epochs 20 \
   --num_cams 4 \
-  --feature_dim 32 \
+  --feature_dim 16 \
   --batch_size 4 \
   --num_workers 0 \
   --base_ch_feat 16 \
