@@ -18,6 +18,16 @@ def do_nothing():
     yield
 
 
+def use_mixed_precision(args, device):
+    return bool(args.mixed_precision and device.type == "cuda")
+
+
+def feature_map_autocast(args, device):
+    if use_mixed_precision(args, device):
+        return torch.cuda.amp.autocast(dtype=torch.float16)
+    return do_nothing()
+
+
 def move_camera_list(items, device, dtype=None):
     moved = []
     for item in items:
@@ -49,7 +59,9 @@ def predict(
             image = images[camera_id].to(device=device, non_blocking=True)
             depth = depths[camera_id]
             img_proc = torch.cat([image, depth], dim=1)
-            features.append(feature_model(img_proc))
+            with feature_map_autocast(args, device):
+                feature = feature_model(img_proc)
+            features.append(feature.float())
 
         bev_features = projection_model(
             depths,
@@ -58,7 +70,9 @@ def predict(
             features,
             pixel_step=args.pixel_step,
         )
-        logits = mapping_model(bev_features)
+        with feature_map_autocast(args, device):
+            logits = mapping_model(bev_features)
+        logits = logits.float()
         target = get_target(static_grids, device)
 
     return logits, target
@@ -74,6 +88,7 @@ def train_batch(
     mapping_model,
     train_dataloader,
     logger,
+    scaler,
     device,
     args,
 ) -> None:
@@ -95,8 +110,9 @@ def train_batch(
         loss = criterion(logits, target, ignore_index=args.ignore_index)
         score = metrics(logits, target, ignore_index=args.ignore_index)
 
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         logger.log_train_loss(loss.detach().item())
         logger.log_train_score(score)
@@ -188,6 +204,7 @@ def run_training(args):
         [group for group in param_groups if group is not None],
         weight_decay=args.weight_decay,
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision(args, device))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=args.epochs,
@@ -215,6 +232,7 @@ def run_training(args):
             mapping_model,
             train_dataloader,
             logger,
+            scaler,
             device,
             args,
         )
@@ -250,6 +268,11 @@ def main():
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--log_dir", type=str, default="runs/train")
     parser.add_argument("--data_dir", type=str, default=str(DATA_DIR))
+    parser.add_argument("--mixed_precision", dest="mixed_precision", action="store_true")
+    parser.add_argument(
+        "--no_mixed_precision", dest="mixed_precision", action="store_false"
+    )
+    parser.set_defaults(mixed_precision=True)
     args = parser.parse_args()
     run_training(args)
 
