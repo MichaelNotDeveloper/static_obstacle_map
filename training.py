@@ -162,8 +162,8 @@ def make_param_group(model, lr):
 def run_training(args):
     device = get_device()
     data_dir = Path(args.data_dir)
-    dataset_train = BaseDataset(data_dir / "autonomy_yandex_dataset_train")
-    dataset_val = BaseDataset(data_dir / "autonomy_yandex_dataset_val")
+    dataset_train = BaseDataset(data_dir / "train/autonomy_yandex_dataset_train")
+    dataset_val = BaseDataset(data_dir / "val/autonomy_yandex_dataset_val")
     train_dataloader = make_dataloader(
         dataset_train, args.batch_size, True, args.num_workers, device
     )
