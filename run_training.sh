@@ -18,4 +18,8 @@ python3 training.py \
   --ignore_index 255 \
   --log_dir runs/train \
   --data_dir /Users/meshaza/Desktop/projects/static_obstacle_map \
+  --test_data_dir /Users/meshaza/Desktop/projects/static_obstacle_map/autonomy_yandex_dataset_test \
+  --submission_dir submission \
+  --best_checkpoint runs/train/checkpoints/best.pt \
+  --pred_threshold 0.5 \
   --mixed_precision

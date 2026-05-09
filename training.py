@@ -1,7 +1,9 @@
 import argparse
 from contextlib import contextmanager
 from pathlib import Path
+import shutil
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
@@ -43,13 +45,13 @@ def get_target(static_grids, device):
     return target.to(device=device, non_blocking=True)
 
 
-def predict(
+def predict_logits(
     batch, feature_model, projection_model, mapping_model, device, args, nograd=False
 ):
     use_grad = torch.no_grad if nograd else do_nothing
 
     with use_grad():
-        images, depths, intrinsics, car2cams, static_grids = batch
+        images, depths, intrinsics, car2cams = batch[:4]
         depths = move_camera_list(depths, device)
         intrinsics = move_camera_list(intrinsics, device, dtype=torch.float32)
         car2cams = move_camera_list(car2cams, device, dtype=torch.float32)
@@ -73,8 +75,23 @@ def predict(
         with feature_map_autocast(args, device):
             logits = mapping_model(bev_features)
         logits = logits.float()
-        target = get_target(static_grids, device)
 
+    return logits
+
+
+def predict(
+    batch, feature_model, projection_model, mapping_model, device, args, nograd=False
+):
+    logits = predict_logits(
+        batch,
+        feature_model,
+        projection_model,
+        mapping_model,
+        device,
+        args,
+        nograd=nograd,
+    )
+    target = get_target(batch[4], device)
     return logits, target
 
 
@@ -180,6 +197,110 @@ def make_param_group(model, lr):
     return {"params": params, "lr": lr}
 
 
+def make_models(args, device):
+    feature_model = RoadPixelFeatureNet(
+        4, feature_dim=args.feature_dim, base_ch=args.base_ch_feat
+    ).to(device)
+    projection_model = DepthToBEVProjection().to(device)
+    mapping_model = BEVSegNet(in_ch=args.feature_dim, base_ch=args.base_ch_map).to(
+        device
+    )
+    return feature_model, projection_model, mapping_model
+
+
+def load_checkpoint(checkpoint_path, feature_model, projection_model, mapping_model):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    models = checkpoint["models"]
+    feature_model.load_state_dict(models["feature_model"])
+    projection_model.load_state_dict(models["projection_model"])
+    mapping_model.load_state_dict(models["mapping_model"])
+    return checkpoint
+
+
+def resolve_test_data_dir(args):
+    if args.test_data_dir is not None:
+        return Path(args.test_data_dir)
+
+    data_dir = Path(args.data_dir)
+    candidates = [
+        data_dir / "test",
+        data_dir / "test/autonomy_yandex_dataset_test",
+        data_dir / "autonomy_yandex_dataset_test",
+    ]
+    for candidate in candidates:
+        if (candidate / "info.csv").exists():
+            return candidate
+    return candidates[0]
+
+
+def prediction_file_name(row, row_id):
+    if "predicted_occupancy_grid" in row:
+        return Path(str(row["predicted_occupancy_grid"]).replace(":", "_")).name
+    if "gt_occupancy_grid" in row:
+        return Path(str(row["gt_occupancy_grid"]).replace(":", "_")).name
+    return f"{row_id}_grid.npy"
+
+
+def run_test_predictions(args):
+    checkpoint_path = Path(args.best_checkpoint)
+    if not checkpoint_path.exists():
+        checkpoint_path = Path(args.log_dir) / "checkpoints" / "best.pt"
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Best checkpoint not found: {checkpoint_path}")
+
+    device = get_device()
+    test_data_dir = resolve_test_data_dir(args)
+    output_dir = Path(args.submission_dir)
+    predicted_dir = output_dir / "predicted_static_grids"
+    predicted_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(test_data_dir / "info.csv", output_dir / "info.csv")
+
+    dataset_test = BaseDataset(test_data_dir, mode="test")
+    test_dataloader = make_dataloader(
+        dataset_test, args.batch_size, False, args.num_workers, device
+    )
+    feature_model, projection_model, mapping_model = make_models(args, device)
+    checkpoint = load_checkpoint(
+        checkpoint_path,
+        feature_model,
+        projection_model,
+        mapping_model,
+    )
+
+    feature_model.eval()
+    projection_model.eval()
+    mapping_model.eval()
+
+    saved = 0
+    offset = 0
+    for batch in tqdm(test_dataloader, desc="test", leave=False):
+        logits = predict_logits(
+            batch,
+            feature_model,
+            projection_model,
+            mapping_model,
+            device,
+            args,
+            nograd=True,
+        )
+        pred = (torch.sigmoid(logits) > args.pred_threshold).to(torch.int32)
+        pred = pred[:, 0].detach().cpu().numpy()
+
+        for sample_id in range(pred.shape[0]):
+            row = dataset_test.info.iloc[offset + sample_id]
+            file_name = prediction_file_name(row, offset + sample_id)
+            np.save(predicted_dir / file_name, pred[sample_id])
+            saved += 1
+
+        offset += pred.shape[0]
+
+    print(
+        f"Saved {saved} test predictions to {predicted_dir} "
+        f"from epoch {checkpoint.get('epoch')}, "
+        f"best {checkpoint.get('monitor')}={checkpoint.get('best_metric')}"
+    )
+
+
 def run_training(args):
     device = get_device()
     data_dir = Path(args.data_dir)
@@ -192,13 +313,7 @@ def run_training(args):
         dataset_val, args.batch_size, False, args.num_workers, device
     )
 
-    feature_model = RoadPixelFeatureNet(
-        4, feature_dim=args.feature_dim, base_ch=args.base_ch_feat
-    ).to(device)
-    projection_model = DepthToBEVProjection().to(device)
-    mapping_model = BEVSegNet(in_ch=args.feature_dim, base_ch=args.base_ch_map).to(
-        device
-    )
+    feature_model, projection_model, mapping_model = make_models(args, device)
 
     param_groups = [
         make_param_group(feature_model, args.feat_lr),
@@ -276,6 +391,15 @@ def main():
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--log_dir", type=str, default="runs/train")
     parser.add_argument("--data_dir", type=str, default=str(DATA_DIR))
+    parser.add_argument("--test_data_dir", type=str, default=None)
+    parser.add_argument("--submission_dir", type=str, default="submission")
+    parser.add_argument(
+        "--best_checkpoint",
+        type=str,
+        default="runs/train/checkpoints/best.pt",
+    )
+    parser.add_argument("--pred_threshold", type=float, default=0.5)
+    parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--mixed_precision", dest="mixed_precision", action="store_true")
     parser.add_argument(
         "--no_mixed_precision", dest="mixed_precision", action="store_false"
@@ -283,6 +407,8 @@ def main():
     parser.set_defaults(mixed_precision=True)
     args = parser.parse_args()
     run_training(args)
+    if not args.skip_test:
+        run_test_predictions(args)
 
 
 if __name__ == "__main__":
