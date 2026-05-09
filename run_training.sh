@@ -6,7 +6,7 @@ python3 training.py \
   --epochs 20 \
   --num_cams 4 \
   --feature_dim 32 \
-  --batch_size 4 \
+  --batch_size 1 \
   --num_workers 0 \
   --base_ch_feat 16 \
   --base_ch_map 16 \
@@ -16,4 +16,5 @@ python3 training.py \
   --min_lr 1e-5 \
   --weight_decay 1e-4 \
   --ignore_index 255 \
-  --log_dir runs/train
+  --log_dir runs/train \
+  --data_dir /Users/meshaza/Desktop/projects/static_obstacle_map

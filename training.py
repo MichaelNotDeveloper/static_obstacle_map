@@ -1,5 +1,6 @@
 import argparse
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from tqdm import tqdm
@@ -160,8 +161,9 @@ def make_param_group(model, lr):
 
 def run_training(args):
     device = get_device()
-    dataset_train = BaseDataset(DATA_DIR / "autonomy_yandex_dataset_train")
-    dataset_val = BaseDataset(DATA_DIR / "autonomy_yandex_dataset_val")
+    data_dir = Path(args.data_dir)
+    dataset_train = BaseDataset(data_dir / "autonomy_yandex_dataset_train")
+    dataset_val = BaseDataset(data_dir / "autonomy_yandex_dataset_val")
     train_dataloader = make_dataloader(
         dataset_train, args.batch_size, True, args.num_workers, device
     )
@@ -247,6 +249,7 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--log_dir", type=str, default="runs/train")
+    parser.add_argument("--data_dir", type=str, default=str(DATA_DIR))
     args = parser.parse_args()
     run_training(args)
 
