@@ -115,8 +115,8 @@ class BaseDataset(torch.utils.data.Dataset):
 
         if self.mode != "test":
             static_grids = [
-                np.load(grid_path) for grid_path in self.static_grids_paths[idx]
-            ]
+                np.load(grid_path) for grid_path in self.static_grids_paths[idx] 
+            ][0]
             return images, depths, intrinsics, car2cams, static_grids
 
         return images, depths, intrinsics, car2cams

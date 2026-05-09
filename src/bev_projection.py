@@ -50,7 +50,9 @@ class DepthToBEVProjection(nn.Module):
         self.normalize_features = normalize_features
         self.calibration_image_shape = calibration_image_shape
 
-        self.register_buffer("log_depth_scale", torch.log(torch.tensor(float(depth_scale))))
+        self.register_buffer(
+            "log_depth_scale", torch.log(torch.tensor(float(depth_scale)))
+        )
         self.register_buffer("depth_bias", torch.tensor(float(depth_bias)))
 
     def forward(
@@ -62,10 +64,10 @@ class DepthToBEVProjection(nn.Module):
         pixel_step=1,
         return_debug=False,
     ):
-        depths = self._stack_camera_tensor(depths) # [B, 1, H, W]
+        depths = self._stack_camera_tensor(depths)  # [B, 1, H, W]
         intrinsics = self._stack_camera_tensor(intrinsics).to(
             device=depths.device, dtype=depths.dtype
-        ) # []
+        )  # []
         extrinsics = self._stack_camera_tensor(extrinsics).to(
             device=depths.device, dtype=depths.dtype
         )
@@ -379,9 +381,7 @@ def plot_debug_batch(
                 vmin=vmin,
                 vmax=max(vmax, vmin + 1e-6),
             )
-            axes[row0 + 2, local_idx].set_title(
-                f"distance {vmin:.1f}-{vmax:.1f} m"
-            )
+            axes[row0 + 2, local_idx].set_title(f"distance {vmin:.1f}-{vmax:.1f} m")
             axes[row0 + 2, local_idx].axis("off")
 
         for row in (row0 + 1, row0 + 2):
