@@ -96,7 +96,8 @@ def train_batch(
     projection_model.train()
     mapping_model.train()
 
-    for batch in tqdm(train_dataloader, desc="train", leave=False):
+    progress = tqdm(train_dataloader, desc="train", leave=False)
+    for batch in progress:
         optimizer.zero_grad(set_to_none=True)
         logits, target = predict(
             batch,
@@ -116,6 +117,10 @@ def train_batch(
 
         logger.log_train_loss(loss.detach().item())
         logger.log_train_score(score)
+        progress.set_postfix(
+            loss=f"{loss.detach().item():.5f}",
+            iou=f"{score.get('iou', 0.0):.5f}",
+        )
 
     scheduler.step()
 
