@@ -7,7 +7,6 @@ import numpy as np
 from transformers import pipeline
 import functools
 from torch.utils.data._utils.collate import default_collate
-from torch.utils.data._utils.collate import default_collate
 
 DATA_DIR = Path("/Users/meshaza/Desktop/projects/static_obstacle_map/")
 
@@ -88,11 +87,11 @@ def collate_camera_batch(batch):
 class BaseDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir: Path, mode: str = "train"):
         self.mode = mode
-        self.data_dir = data_dir
+        self.data_dir = Path(data_dir)
         self.transform = get_transforms()
         self.depth_transform = get_depth_transforms()
         self.depth_model = get_depth_model()
-        self.info = pd.read_csv(data_dir / "info.csv", index_col=0)
+        self.info = pd.read_csv(self.data_dir / "info.csv", index_col=0)
         self.images_paths = []
         self.intrinsics_paths = []
         self.car2cam_paths = []
@@ -102,18 +101,35 @@ class BaseDataset(torch.utils.data.Dataset):
 
         for _, row in self.info.iterrows():
             self.images_paths.append(
-                [row[name].replace(":", "_") for name in CAMERA_NAMES]
+                [self.resolve_data_path(row[name]) for name in CAMERA_NAMES]
             )
             self.intrinsics_paths.append(
-                [row[name].replace(":", "_") for name in INTRINSICS_NAMES]
+                [self.resolve_data_path(row[name]) for name in INTRINSICS_NAMES]
             )
             self.car2cam_paths.append(
-                [row[name].replace(":", "_") for name in CAR2CAM_NAMES]
+                [self.resolve_data_path(row[name]) for name in CAR2CAM_NAMES]
             )
             if self.mode != "test":
                 self.static_grids_paths.append(
-                    [row[name].replace(":", "_") for name in GRIDS_NAMES]
+                    [self.resolve_data_path(row[name]) for name in GRIDS_NAMES]
                 )
+
+    def resolve_data_path(self, value):
+        path = Path(str(value).replace(":", "_"))
+        if path.is_absolute():
+            return path
+
+        candidates = []
+        if path.parts and path.parts[0] == self.data_dir.name:
+            candidates.append(self.data_dir / Path(*path.parts[1:]))
+        candidates.append(self.data_dir / path)
+        candidates.append(self.data_dir.parent / path)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        return candidates[0]
 
     def __len__(self):
         return len(self.info)
