@@ -136,11 +136,15 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         images = [Image.open(img_path) for img_path in self.images_paths[idx]]
+        depth_outputs = self.depth_model(images)
+        if isinstance(depth_outputs, dict):
+            depth_outputs = [depth_outputs]
+
         depths = [
             self.depth_transform(
-                self.depth_model(sample)["predicted_depth"].unsqueeze(0)
+                output["predicted_depth"].unsqueeze(0)
             )
-            for sample in images
+            for output in depth_outputs
         ]
         images = [self.transform(sample) for sample in images]
         intrinsics = [np.load(intr_path) for intr_path in self.intrinsics_paths[idx]]

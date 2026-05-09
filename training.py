@@ -24,7 +24,7 @@ def use_mixed_precision(args, device):
 
 def feature_map_autocast(args, device):
     if use_mixed_precision(args, device):
-        return torch.cuda.amp.autocast(dtype=torch.float16)
+        return torch.amp.autocast("cuda", dtype=torch.float16)
     return do_nothing()
 
 
@@ -204,7 +204,10 @@ def run_training(args):
         [group for group in param_groups if group is not None],
         weight_decay=args.weight_decay,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision(args, device))
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=use_mixed_precision(args, device),
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=args.epochs,
