@@ -89,9 +89,47 @@ class Logger:
         return float(sum(values) / len(values))
 
     def _mean_scores(self, prefix, storage):
+        count_names = {
+            "tp",
+            "fp",
+            "fn",
+            "tn",
+            "valid_count",
+            "target_pos_count",
+            "pred_pos_count",
+            "prob_sum",
+            "prob_sq_sum",
+        }
+        if {"tp", "fp", "fn", "tn"}.issubset(storage):
+            eps = 1e-6
+            tp = sum(storage["tp"])
+            fp = sum(storage["fp"])
+            fn = sum(storage["fn"])
+            tn = sum(storage["tn"])
+            valid_count = max(sum(storage.get("valid_count", [0.0])), 1.0)
+            target_pos = sum(storage.get("target_pos_count", [0.0]))
+            pred_pos = sum(storage.get("pred_pos_count", [0.0]))
+            prob_sum = sum(storage.get("prob_sum", [0.0]))
+            prob_sq_sum = sum(storage.get("prob_sq_sum", [0.0]))
+            prob_mean = prob_sum / valid_count
+            prob_var = max(prob_sq_sum / valid_count - prob_mean * prob_mean, 0.0)
+
+            return {
+                f"{prefix}_accuracy": (tp + tn + eps) / (tp + tn + fp + fn + eps),
+                f"{prefix}_dice": (2 * tp + eps) / (2 * tp + fp + fn + eps),
+                f"{prefix}_iou": (tp + eps) / (tp + fp + fn + eps),
+                f"{prefix}_precision": (tp + eps) / (tp + fp + eps),
+                f"{prefix}_prob_mean": prob_mean,
+                f"{prefix}_prob_std": prob_var ** 0.5,
+                f"{prefix}_recall": (tp + eps) / (tp + fn + eps),
+                f"{prefix}_target_pos_ratio": target_pos / valid_count,
+                f"{prefix}_pred_pos_ratio": pred_pos / valid_count,
+            }
+
         return {
             f"{prefix}_{name}": self._mean(values)
             for name, values in sorted(storage.items())
+            if name not in count_names
         }
 
     def _print_metrics(self, metrics):

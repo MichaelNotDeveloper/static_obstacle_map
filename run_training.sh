@@ -2,14 +2,15 @@
 set -e
 
 python3 training.py \
-  --pixel_step 8 \
-  --epochs 20 \
+  --pixel_step 1 \
+  --epochs 6 \
   --num_cams 4 \
   --feature_dim 16 \
   --batch_size 4 \
   --num_workers 0 \
   --base_ch_feat 16 \
   --base_ch_map 16 \
+  --depth_scale 0.5 \
   --feat_lr 1e-4 \
   --projection_lr 1e-4 \
   --mapping_lr 1e-4 \

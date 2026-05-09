@@ -2,9 +2,9 @@ import pandas as pd
 from PIL import Image
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 from torchvision.transforms import v2
 import numpy as np
-from transformers import pipeline
 import functools
 from torch.utils.data._utils.collate import default_collate
 
@@ -35,7 +35,88 @@ GRIDS_NAMES = [
     "gt_occupancy_grid",
 ]
 
-IMG_SHAPE = (540, 1024)
+IMG_SHAPE = (256, 512)
+CALIBRATION_IMAGE_SHAPE = (540, 1024)
+
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
+
+class FastDepthAnythingMeters:
+    def __init__(
+        self,
+        model_id="depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf",
+        device=None,
+    ):
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+
+        self.device = torch.device(device)
+        self.processor = AutoImageProcessor.from_pretrained(model_id)
+        self.model = AutoModelForDepthEstimation.from_pretrained(model_id)
+        self.model.to(self.device).eval()
+
+    @torch.inference_mode()
+    def __call__(self, images, batch_size=8, return_numpy=False):
+        single = isinstance(images, Image.Image)
+        images = [images] if single else list(images)
+
+        all_depths = []
+
+        for start in range(0, len(images), batch_size):
+            batch = images[start:start + batch_size]
+            sizes = [(img.height, img.width) for img in batch]
+
+            inputs = self.processor(images=batch, return_tensors="pt")
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            outputs = self.model(**inputs)
+            pred = outputs.predicted_depth  # [B, h, w], metric depth for metric model
+
+            if len(set(sizes)) == 1:
+                depth = F.interpolate(
+                    pred.unsqueeze(1),
+                    size=sizes[0],
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze(1)
+
+                all_depths.extend(depth.cpu())
+            else:
+                for d, size in zip(pred, sizes):
+                    d = F.interpolate(
+                        d[None, None],
+                        size=size,
+                        mode="bicubic",
+                        align_corners=False,
+                    )[0, 0]
+                    all_depths.append(d.cpu())
+
+        if return_numpy:
+            all_depths = [d.numpy() for d in all_depths]
+
+        return all_depths[0] if single else all_depths
+
+
+@functools.cache
+def get_depth_model():
+    return FastDepthAnythingMeters(
+        model_id="depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf"
+    )
+
+
+@functools.cache
+def get_resize_transform():
+    transform = v2.Compose(
+        [
+            v2.Resize(IMG_SHAPE, antialias=True),
+        ]
+    )
+    return transform
 
 
 @functools.cache
@@ -43,29 +124,11 @@ def get_transforms():
     transform = v2.Compose(
         [
             v2.PILToTensor(),
-            v2.Resize(IMG_SHAPE, antialias=True),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ]
     )
     return transform
-
-
-def get_depth_transforms():
-    transform = v2.Compose(
-        [
-            v2.Resize(IMG_SHAPE, antialias=True),
-            v2.ToDtype(torch.float32, scale=True),
-        ]
-    )
-    return transform
-
-
-@functools.cache
-def get_depth_model():
-    return pipeline(
-        "depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf"
-    )
 
 
 def collate_camera_batch(batch):
@@ -88,8 +151,8 @@ class BaseDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir: Path, mode: str = "train"):
         self.mode = mode
         self.data_dir = Path(data_dir)
+        self.resize_transform = get_resize_transform()
         self.transform = get_transforms()
-        self.depth_transform = get_depth_transforms()
         self.depth_model = get_depth_model()
         self.info = pd.read_csv(self.data_dir / "info.csv", index_col=0)
         self.images_paths = []
@@ -135,16 +198,15 @@ class BaseDataset(torch.utils.data.Dataset):
         return len(self.info)
 
     def __getitem__(self, idx):
-        images = [Image.open(img_path) for img_path in self.images_paths[idx]]
-        depth_outputs = self.depth_model(images)
-        if isinstance(depth_outputs, dict):
-            depth_outputs = [depth_outputs]
+        images = [
+            self.resize_transform(Image.open(img_path).convert("RGB"))
+            for img_path in self.images_paths[idx]
+        ]
+        depth_outputs = self.depth_model(images, batch_size=len(images))
 
         depths = [
-            self.depth_transform(
-                output["predicted_depth"].unsqueeze(0)
-            )
-            for output in depth_outputs
+            depth.to(dtype=torch.float32).unsqueeze(0)
+            for depth in depth_outputs
         ]
         images = [self.transform(sample) for sample in images]
         intrinsics = [np.load(intr_path) for intr_path in self.intrinsics_paths[idx]]

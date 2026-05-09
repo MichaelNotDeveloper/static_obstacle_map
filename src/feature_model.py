@@ -127,7 +127,7 @@ class RoadPixelFeatureNet(nn.Module):
         feature_dim=64,
         base_ch=32,
         num_classes=None,
-        normalize_features=True,
+        normalize_features=False,
     ):
         super().__init__()
 
@@ -185,9 +185,6 @@ class RoadPixelFeatureNet(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-
-        if self.normalize_features:
-            features = F.normalize(features, dim=1)
 
         if self.classifier is None:
             return features

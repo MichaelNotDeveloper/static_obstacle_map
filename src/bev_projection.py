@@ -5,12 +5,27 @@ import torch
 from torch import nn
 
 try:
-    from .dataset import CAMERA_NAMES, INTRINSICS_NAMES, CAR2CAM_NAMES, IMG_SHAPE
+    from .dataset import (
+        CAMERA_NAMES,
+        INTRINSICS_NAMES,
+        CAR2CAM_NAMES,
+        CALIBRATION_IMAGE_SHAPE,
+    )
 except ImportError:
     try:
-        from dataset import CAMERA_NAMES, INTRINSICS_NAMES, CAR2CAM_NAMES, IMG_SHAPE
+        from dataset import (
+            CAMERA_NAMES,
+            INTRINSICS_NAMES,
+            CAR2CAM_NAMES,
+            CALIBRATION_IMAGE_SHAPE,
+        )
     except ImportError:
-        from src.dataset import CAMERA_NAMES, INTRINSICS_NAMES, CAR2CAM_NAMES, IMG_SHAPE
+        from src.dataset import (
+            CAMERA_NAMES,
+            INTRINSICS_NAMES,
+            CAR2CAM_NAMES,
+            CALIBRATION_IMAGE_SHAPE,
+        )
 
 
 class DepthToBEVProjection(nn.Module):
@@ -24,12 +39,12 @@ class DepthToBEVProjection(nn.Module):
         max_depth=150.0,
         depth_scale=1.0,
         depth_bias=0.0,
-        raw_depth_is_inverse=True,
+        raw_depth_is_inverse=False,
         inverse_depth_eps=1e-6,
         extrinsics_are_car_to_cam=True,
         bev_y_sign=-1.0,
         normalize_features=True,
-        calibration_image_shape=IMG_SHAPE,
+        calibration_image_shape=CALIBRATION_IMAGE_SHAPE,
     ):
         super().__init__()
 
@@ -408,12 +423,12 @@ if __name__ == "__main__":
     # debug_cameras = [0, 1, 2, 3]
     # debug_cameras = [2, 3]
     # debug_cameras = ["/camera/inner/frontal/middle", "/side/left/forward"]
-    pixel_step = 8
-    depth_min = 2.0
+    pixel_step = 1
+    depth_min = 0.0
     depth_max = 80.0
-    depth_scale = 30.0
+    depth_scale = 0.5
     depth_bias = 0.0
-    raw_depth_is_inverse = True
+    raw_depth_is_inverse = False
     meters_per_pixel = 150.0 / 188.0
     x_min = 0.0
     y_min = None

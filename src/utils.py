@@ -38,6 +38,7 @@ def binary_bce_loss_with_ignore(logits, target, ignore_index=-1):
     loss = loss * valid_mask.float()
     return loss.sum() / valid_mask.float().sum().clamp_min(1.0)
 
+
 @torch.no_grad()
 def binary_seg_metrics(
     logits: torch.Tensor,
@@ -55,7 +56,7 @@ def binary_seg_metrics(
     prob = torch.sigmoid(logits)
     pred = prob > threshold
 
-    target_bool = target.bool()
+    target_bool = target > 0.5
 
     pred = pred & valid
     target_bool = target_bool & valid
@@ -77,11 +78,17 @@ def binary_seg_metrics(
     pred_pos_ratio = pred.sum().float() / valid_count
 
     if valid.any():
-        prob_mean = prob[valid].mean().item()
-        prob_std = prob[valid].std(unbiased=False).item()
+        valid_prob = prob[valid]
+        prob_sum = valid_prob.sum()
+        prob_sq_sum = (valid_prob * valid_prob).sum()
+        prob_mean = prob_sum / valid_count
+        prob_var = (prob_sq_sum / valid_count - prob_mean * prob_mean).clamp_min(0.0)
+        prob_std = prob_var.sqrt()
     else:
-        prob_mean = 0.0
-        prob_std = 0.0
+        prob_sum = logits.new_tensor(0.0)
+        prob_sq_sum = logits.new_tensor(0.0)
+        prob_mean = logits.new_tensor(0.0)
+        prob_std = logits.new_tensor(0.0)
 
     return {
         "iou": iou.item(),
@@ -91,6 +98,15 @@ def binary_seg_metrics(
         "recall": recall.item(),
         "target_pos_ratio": target_pos_ratio.item(),
         "pred_pos_ratio": pred_pos_ratio.item(),
-        "prob_mean": prob_mean,
-        "prob_std": prob_std,
+        "prob_mean": prob_mean.item(),
+        "prob_std": prob_std.item(),
+        "tp": tp.item(),
+        "fp": fp.item(),
+        "fn": fn.item(),
+        "tn": tn.item(),
+        "valid_count": valid_count.item(),
+        "target_pos_count": target_bool.sum().float().item(),
+        "pred_pos_count": pred.sum().float().item(),
+        "prob_sum": prob_sum.item(),
+        "prob_sq_sum": prob_sq_sum.item(),
     }

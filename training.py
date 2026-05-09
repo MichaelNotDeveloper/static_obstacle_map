@@ -215,7 +215,7 @@ def make_models(args, device):
     feature_model = RoadPixelFeatureNet(
         4, feature_dim=args.feature_dim, base_ch=args.base_ch_feat
     ).to(device)
-    projection_model = DepthToBEVProjection().to(device)
+    projection_model = DepthToBEVProjection(depth_scale=args.depth_scale).to(device)
     mapping_model = BEVSegNet(in_ch=args.feature_dim, base_ch=args.base_ch_map).to(
         device
     )
@@ -397,6 +397,7 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--base_ch_feat", type=int, default=16)
     parser.add_argument("--base_ch_map", type=int, default=16)
+    parser.add_argument("--depth_scale", type=float, default=1.0)
     parser.add_argument("--feat_lr", type=float, default=1e-4)
     parser.add_argument("--projection_lr", type=float, default=1e-4)
     parser.add_argument("--mapping_lr", type=float, default=1e-4)
