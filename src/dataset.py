@@ -7,6 +7,7 @@ import numpy as np
 from transformers import pipeline
 import functools
 from torch.utils.data._utils.collate import default_collate
+from torch.utils.data._utils.collate import default_collate
 
 DATA_DIR = Path("/Users/meshaza/Desktop/projects/static_obstacle_map/")
 
@@ -68,6 +69,22 @@ def get_depth_model():
     )
 
 
+def collate_camera_batch(batch):
+    def collate_camera_list(samples):
+        return [default_collate(camera_samples) for camera_samples in zip(*samples)]
+
+    images = collate_camera_list([sample[0] for sample in batch])
+    depths = collate_camera_list([sample[1] for sample in batch])
+    intrinsics = collate_camera_list([sample[2] for sample in batch])
+    car2cams = collate_camera_list([sample[3] for sample in batch])
+
+    if len(batch[0]) == 4:
+        return images, depths, intrinsics, car2cams
+
+    static_grids = [default_collate([sample[4] for sample in batch])]
+    return images, depths, intrinsics, car2cams, static_grids
+
+
 class BaseDataset(torch.utils.data.Dataset):
     def __init__(self, data_dir: Path, mode: str = "train"):
         self.mode = mode
@@ -115,7 +132,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         if self.mode != "test":
             static_grids = [
-                np.load(grid_path) for grid_path in self.static_grids_paths[idx] 
+                np.load(grid_path) for grid_path in self.static_grids_paths[idx]
             ][0]
             return images, depths, intrinsics, car2cams, static_grids
 
@@ -127,7 +144,11 @@ if __name__ == "__main__":
 
     dataset = BaseDataset(DATA_DIR / "autonomy_yandex_dataset_train", "train")
     img_num = 10
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=img_num)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=img_num,
+        collate_fn=collate_camera_batch,
+    )
     fig, ax = plt.subplots(img_num, 8, figsize=(100, 140))
     for imgs, depths, _, _, static_grids in dataloader:
         for i in range(len(imgs)):

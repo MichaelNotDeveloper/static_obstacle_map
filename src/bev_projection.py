@@ -395,12 +395,12 @@ def plot_debug_batch(
 
 if __name__ == "__main__":
     try:
-        from .dataset import BaseDataset
+        from .dataset import BaseDataset, collate_camera_batch
     except ImportError:
         try:
-            from dataset import BaseDataset
+            from dataset import BaseDataset, collate_camera_batch
         except ImportError:
-            from src.dataset import BaseDataset
+            from src.dataset import BaseDataset, collate_camera_batch
 
     data_dir = Path("autonomy_yandex_dataset_train")
     batch_size = 4
@@ -425,6 +425,7 @@ if __name__ == "__main__":
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
+        collate_fn=collate_camera_batch,
     )
     projector = DepthToBEVProjection(
         meters_per_pixel=meters_per_pixel,

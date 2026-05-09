@@ -1,0 +1,6 @@
+src/__pycache__/*
+__pycache__/
+.DS_Store
+autonomy_yandex_dataset_train/
+bev_projection_debug.png
+image_transforms.png

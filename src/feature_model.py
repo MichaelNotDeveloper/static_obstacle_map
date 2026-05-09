@@ -2,7 +2,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from utils import make_norm
+try:
+    from .utils import make_norm
+except ImportError:
+    from utils import make_norm
 
 
 class ResBlock(nn.Module):
