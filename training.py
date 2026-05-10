@@ -1,5 +1,6 @@
 import argparse
 from contextlib import contextmanager
+import math
 from pathlib import Path
 import shutil
 
@@ -12,7 +13,7 @@ from src.dataset import BaseDataset, DATA_DIR, collate_camera_batch
 from src.feature_model import RoadPixelFeatureNet
 from src.logger import Logger
 from src.obstacle_model import BEVSegNet
-from src.utils import get_device, binary_bce_loss_with_ignore, binary_seg_metrics
+from src.utils import get_device, binary_bce_dice_loss_with_ignore, binary_seg_metrics
 
 
 @contextmanager
@@ -59,6 +60,14 @@ def make_camera_color_features(images, camera_id, num_cams):
     return features
 
 
+def make_camera_feature_block(features, camera_id, num_cams):
+    batch, channels, height, width = features.shape
+    output = features.new_zeros(batch, num_cams * channels, height, width)
+    start = camera_id * channels
+    output[:, start : start + channels] = features
+    return output
+
+
 def predict_logits(
     batch, feature_model, projection_model, mapping_model, device, args, nograd=False
 ):
@@ -78,6 +87,8 @@ def predict_logits(
                 img_proc = torch.cat([image, depth], dim=1) if args.use_depth else image
                 with feature_map_autocast(args, device):
                     feature = feature_model(img_proc)
+                if args.camera_feature_channels:
+                    feature = make_camera_feature_block(feature, camera_id, args.num_cams)
             else:
                 feature = make_camera_color_features(image, camera_id, args.num_cams)
             features.append(feature.float())
@@ -89,6 +100,10 @@ def predict_logits(
             features,
             pixel_step=args.pixel_step,
             use_ground_plane=not args.use_depth,
+            append_coverage=args.use_coverage_map,
+            camera_separated_values=(
+                (not args.use_feature_model) or args.camera_feature_channels
+            ),
         )
         with feature_map_autocast(args, device):
             logits = mapping_model(bev_features)
@@ -126,7 +141,10 @@ def train_batch(
     scaler,
     device,
     args,
-) -> None:
+    global_step,
+    total_steps,
+    warmup_steps,
+):
     if feature_model is not None:
         feature_model.train()
     projection_model.train()
@@ -134,6 +152,8 @@ def train_batch(
 
     progress = tqdm(train_dataloader, desc="train", leave=False)
     for batch in progress:
+        global_step += 1
+        set_warmup_cosine_lr(optimizer, args, global_step, total_steps, warmup_steps)
         optimizer.zero_grad(set_to_none=True)
         logits, target = predict(
             batch,
@@ -144,7 +164,13 @@ def train_batch(
             args,
             nograd=False,
         )
-        loss = criterion(logits, target, ignore_index=args.ignore_index)
+        loss = criterion(
+            logits,
+            target,
+            ignore_index=args.ignore_index,
+            bce_weight=args.bce_weight,
+            dice_weight=args.dice_weight,
+        )
         score = metrics(logits, target, ignore_index=args.ignore_index)
 
         scaler.scale(loss).backward()
@@ -159,9 +185,10 @@ def train_batch(
             loss=f"{loss.detach().item():.5f}",
             iou=f"{score.get('iou', 0.0):.5f}",
             grad_norm=f"{norm:.3f}",
+            lr=f"{optimizer.param_groups[0]['lr']:.2e}",
         )
 
-    scheduler.step()
+    return global_step
 
 
 def val_batch(
@@ -190,7 +217,13 @@ def val_batch(
             args,
             nograd=True,
         )
-        loss = criterion(logits, target, ignore_index=args.ignore_index)
+        loss = criterion(
+            logits,
+            target,
+            ignore_index=args.ignore_index,
+            bce_weight=args.bce_weight,
+            dice_weight=args.dice_weight,
+        )
         score = metrics(logits, target, ignore_index=args.ignore_index)
 
         logger.log_val_loss(loss.detach().item())
@@ -222,6 +255,24 @@ def make_param_group(model, lr):
     return {"params": params, "lr": lr}
 
 
+def set_warmup_cosine_lr(optimizer, args, step, total_steps, warmup_steps):
+    warmup_steps = max(int(warmup_steps), 0)
+    total_steps = max(int(total_steps), 1)
+
+    if warmup_steps > 0 and step <= warmup_steps:
+        factor = step / float(warmup_steps)
+    else:
+        denom = max(total_steps - warmup_steps, 1)
+        progress = (step - warmup_steps) / float(denom)
+        progress = min(max(progress, 0.0), 1.0)
+        factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    for group in optimizer.param_groups:
+        base_lr = group.setdefault("base_lr", group["lr"])
+        min_lr = min(float(args.min_lr), float(base_lr))
+        group["lr"] = min_lr + (float(base_lr) - min_lr) * factor
+
+
 def grad_norm(models):
     total = 0.0
     for model in models:
@@ -248,7 +299,14 @@ def make_models(args, device):
         depth_scale=args.depth_scale,
         ground_z=args.ground_z,
     ).to(device)
-    map_in_ch = args.feature_dim if args.use_feature_model else args.num_cams * 3
+    if args.use_feature_model:
+        map_in_ch = args.feature_dim
+        if args.camera_feature_channels:
+            map_in_ch *= args.num_cams
+    else:
+        map_in_ch = args.num_cams * 3
+    if args.use_coverage_map:
+        map_in_ch += 1
     mapping_model = BEVSegNet(in_ch=map_in_ch, base_ch=args.base_ch_map).to(
         device
     )
@@ -362,6 +420,7 @@ def run_training(args):
         data_dir / "train/autonomy_yandex_dataset_train",
         use_depth=args.use_depth,
         default_depth=args.default_depth,
+        augment=args.augment,
     )
     dataset_val = BaseDataset(
         data_dir / "val/autonomy_yandex_dataset_val",
@@ -390,11 +449,6 @@ def run_training(args):
         "cuda",
         enabled=use_mixed_precision(args, device),
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-        eta_min=args.min_lr,
-    )
     logger = Logger(
         {
             "feature_model": feature_model,
@@ -405,13 +459,18 @@ def run_training(args):
         monitor="val_iou",
         mode="max",
     )
+    total_steps = max(args.epochs * len(train_dataloader), 1)
+    warmup_steps = args.warmup_steps
+    if warmup_steps <= 0:
+        warmup_steps = args.warmup_epochs * len(train_dataloader)
+    global_step = 0
 
     for epoch in range(1, args.epochs + 1):
-        train_batch(
-            binary_bce_loss_with_ignore,
+        global_step = train_batch(
+            binary_bce_dice_loss_with_ignore,
             binary_seg_metrics,
             optimizer,
-            scheduler,
+            None,
             feature_model,
             projection_model,
             mapping_model,
@@ -420,9 +479,12 @@ def run_training(args):
             scaler,
             device,
             args,
+            global_step,
+            total_steps,
+            warmup_steps,
         )
         val_batch(
-            binary_bce_loss_with_ignore,
+            binary_bce_dice_loss_with_ignore,
             binary_seg_metrics,
             feature_model,
             projection_model,
@@ -452,6 +514,10 @@ def main():
     parser.add_argument("--projection_lr", type=float, default=1e-4)
     parser.add_argument("--mapping_lr", type=float, default=1e-4)
     parser.add_argument("--min_lr", type=float, default=1e-5)
+    parser.add_argument("--warmup_epochs", type=int, default=2)
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument("--bce_weight", type=float, default=1.0)
+    parser.add_argument("--dice_weight", type=float, default=1.0)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--log_dir", type=str, default="runs/train")
@@ -465,6 +531,20 @@ def main():
     )
     parser.add_argument("--pred_threshold", type=float, default=0.5)
     parser.add_argument("--skip_test", action="store_true")
+    parser.add_argument("--augment", dest="augment", action="store_true")
+    parser.add_argument("--no_augment", dest="augment", action="store_false")
+    parser.add_argument("--use_coverage_map", dest="use_coverage_map", action="store_true")
+    parser.add_argument("--no_coverage_map", dest="use_coverage_map", action="store_false")
+    parser.add_argument(
+        "--camera_feature_channels",
+        dest="camera_feature_channels",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--shared_camera_features",
+        dest="camera_feature_channels",
+        action="store_false",
+    )
     parser.add_argument("--use_feature_model", dest="use_feature_model", action="store_true")
     parser.add_argument("--no_feature_model", dest="use_feature_model", action="store_false")
     parser.add_argument("--use_depth", dest="use_depth", action="store_true")
@@ -473,7 +553,14 @@ def main():
     parser.add_argument(
         "--no_mixed_precision", dest="mixed_precision", action="store_false"
     )
-    parser.set_defaults(mixed_precision=True, use_depth=True, use_feature_model=True)
+    parser.set_defaults(
+        mixed_precision=True,
+        use_depth=True,
+        use_feature_model=True,
+        use_coverage_map=True,
+        camera_feature_channels=True,
+        augment=True,
+    )
     args = parser.parse_args()
     run_training(args)
     if not args.skip_test:

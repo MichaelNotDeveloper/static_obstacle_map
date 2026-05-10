@@ -16,12 +16,7 @@ def make_norm(channels: int) -> torch.nn.GroupNorm:
 
 
 def binary_bce_loss_with_ignore(logits, target, ignore_index=-1):
-    if target.ndim == 3:
-        target = target.unsqueeze(1)
-
-    target = target.to(device=logits.device, dtype=logits.dtype)
-
-    valid_mask = target != ignore_index
+    target, valid_mask = prepare_binary_target(logits, target, ignore_index)
 
     clean_target = torch.where(
         valid_mask,
@@ -37,6 +32,42 @@ def binary_bce_loss_with_ignore(logits, target, ignore_index=-1):
 
     loss = loss * valid_mask.float()
     return loss.sum() / valid_mask.float().sum().clamp_min(1.0)
+
+
+def prepare_binary_target(logits, target, ignore_index=-1):
+    if target.ndim == 3:
+        target = target.unsqueeze(1)
+
+    target = target.to(device=logits.device, dtype=logits.dtype)
+    valid_mask = target != ignore_index
+
+    return target, valid_mask
+
+
+def binary_dice_loss_with_ignore(logits, target, ignore_index=-1, eps=1e-6):
+    target, valid_mask = prepare_binary_target(logits, target, ignore_index)
+
+    prob = torch.sigmoid(logits) * valid_mask.float()
+    target = torch.where(valid_mask, target, torch.zeros_like(target))
+
+    dims = tuple(range(1, prob.ndim))
+    intersection = (prob * target).sum(dim=dims)
+    union = prob.sum(dim=dims) + target.sum(dim=dims)
+    dice = (2.0 * intersection + eps) / (union + eps)
+
+    return 1.0 - dice.mean()
+
+
+def binary_bce_dice_loss_with_ignore(
+    logits,
+    target,
+    ignore_index=-1,
+    bce_weight=1.0,
+    dice_weight=1.0,
+):
+    bce = binary_bce_loss_with_ignore(logits, target, ignore_index=ignore_index)
+    dice = binary_dice_loss_with_ignore(logits, target, ignore_index=ignore_index)
+    return bce_weight * bce + dice_weight * dice
 
 
 @torch.no_grad()

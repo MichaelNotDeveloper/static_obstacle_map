@@ -37,6 +37,12 @@ GRIDS_NAMES = [
 
 IMG_SHAPE = (256, 512)
 CALIBRATION_IMAGE_SHAPE = (540, 1024)
+CALIBRATION_IMAGE_SHAPES = [
+    (546, 1024),
+    (568, 1024),
+    (540, 1024),
+    (540, 1024),
+]
 
 class FastDepthAnythingMeters:
     def __init__(
@@ -119,6 +125,21 @@ def get_resize_transform():
 
 
 @functools.cache
+def get_augment_transform():
+    transform = v2.Compose(
+        [
+            v2.ColorJitter(
+                brightness=0.08,
+                contrast=0.08,
+                saturation=0.05,
+                hue=0.01,
+            ),
+        ]
+    )
+    return transform
+
+
+@functools.cache
 def get_transforms():
     transform = v2.Compose(
         [
@@ -153,13 +174,16 @@ class BaseDataset(torch.utils.data.Dataset):
         mode: str = "train",
         use_depth: bool = True,
         default_depth: float = 30.0,
+        augment: bool = False,
         depth=None,
     ):
         self.mode = mode
         self.data_dir = Path(data_dir)
         self.use_depth = use_depth if depth is None else depth
         self.default_depth = float(default_depth)
+        self.augment = bool(augment)
         self.resize_transform = get_resize_transform()
+        self.augment_transform = get_augment_transform() if self.augment else None
         self.transform = get_transforms()
         self.depth_model = get_depth_model() if self.use_depth else None
         self.info = pd.read_csv(self.data_dir / "info.csv", index_col=0)
@@ -219,6 +243,9 @@ class BaseDataset(torch.utils.data.Dataset):
                 )
                 for _ in images
             ]
+
+        if self.augment_transform is not None:
+            images = [self.augment_transform(sample) for sample in images]
 
         images = [self.transform(sample) for sample in images]
         intrinsics = [np.load(intr_path) for intr_path in self.intrinsics_paths[idx]]

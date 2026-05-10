@@ -9,7 +9,7 @@ try:
         CAMERA_NAMES,
         INTRINSICS_NAMES,
         CAR2CAM_NAMES,
-        CALIBRATION_IMAGE_SHAPE,
+        CALIBRATION_IMAGE_SHAPES,
     )
 except ImportError:
     try:
@@ -17,14 +17,14 @@ except ImportError:
             CAMERA_NAMES,
             INTRINSICS_NAMES,
             CAR2CAM_NAMES,
-            CALIBRATION_IMAGE_SHAPE,
+            CALIBRATION_IMAGE_SHAPES,
         )
     except ImportError:
         from src.dataset import (
             CAMERA_NAMES,
             INTRINSICS_NAMES,
             CAR2CAM_NAMES,
-            CALIBRATION_IMAGE_SHAPE,
+            CALIBRATION_IMAGE_SHAPES,
         )
 
 
@@ -45,7 +45,7 @@ class DepthToBEVProjection(nn.Module):
         bev_y_sign=-1.0,
         ground_z=0.0,
         normalize_features=True,
-        calibration_image_shape=CALIBRATION_IMAGE_SHAPE,
+        calibration_image_shape=CALIBRATION_IMAGE_SHAPES,
     ):
         super().__init__()
 
@@ -80,6 +80,8 @@ class DepthToBEVProjection(nn.Module):
         pixel_values=None,
         pixel_step=1,
         use_ground_plane=False,
+        append_coverage=False,
+        camera_separated_values=False,
         return_debug=False,
     ):
         depths = self._stack_camera_tensor(depths)  # [B, 1, H, W]
@@ -105,10 +107,22 @@ class DepthToBEVProjection(nn.Module):
             points_car, valid, values, depth = self.unproject_to_car(
                 depths, intrinsics, extrinsics, pixel_values, pixel_step
             )
-        bev, weights = self.splat_to_bev(points_car, valid, values)
+        bev, weights, channel_weights = self.splat_to_bev(
+            points_car,
+            valid,
+            values,
+            camera_separated_values=camera_separated_values,
+        )
+        coverage = None
+        if append_coverage or return_debug:
+            coverage = self.camera_coverage(points_car, valid)
 
         if self.normalize_features:
-            bev = bev / weights.clamp_min(1e-6)
+            denominator = channel_weights if camera_separated_values else weights
+            bev = bev / denominator.clamp_min(1e-6)
+
+        if append_coverage:
+            bev = torch.cat([bev, coverage], dim=1)
 
         if return_debug:
             points_bev = points_car.clone()
@@ -116,6 +130,7 @@ class DepthToBEVProjection(nn.Module):
             return {
                 "bev": bev,
                 "weights": weights,
+                "coverage": coverage,
                 "points_car": points_car,
                 "points_bev": points_bev,
                 "valid": valid,
@@ -226,7 +241,6 @@ class DepthToBEVProjection(nn.Module):
         valid = valid & torch.isfinite(depth)
         valid = valid & (denom.abs() > 1e-6)
         valid = valid & (depth > self.min_depth)
-        valid = valid & (depth < self.max_depth)
 
         return points_car, valid, values, depth.unsqueeze(2)
 
@@ -236,7 +250,7 @@ class DepthToBEVProjection(nn.Module):
 
         return depth * self.log_depth_scale.exp() + self.depth_bias
 
-    def splat_to_bev(self, points_car, valid, values):
+    def splat_to_bev(self, points_car, valid, values, camera_separated_values=False):
         batch, num_cams, height, width, _ = points_car.shape
         value_channels = values.shape[2]
         bev_h, bev_w = self.bev_shape
@@ -252,6 +266,12 @@ class DepthToBEVProjection(nn.Module):
 
         bev = values.new_zeros(batch, value_channels, bev_h * bev_w)
         weights = values.new_zeros(batch, 1, bev_h * bev_w)
+        channel_weights = (
+            values.new_zeros(batch, value_channels, bev_h * bev_w)
+            if camera_separated_values and value_channels % num_cams == 0
+            else None
+        )
+        camera_block = value_channels // num_cams if channel_weights is not None else 0
 
         row0 = torch.floor(rows)
         col0 = torch.floor(cols)
@@ -280,17 +300,90 @@ class DepthToBEVProjection(nn.Module):
                 )
                 weights.scatter_add_(2, index.unsqueeze(1), weight.unsqueeze(1))
 
+                if channel_weights is not None:
+                    index_by_cam = index.view(batch, num_cams, -1)
+                    weight_by_cam = weight.view(batch, num_cams, -1)
+                    for camera_id in range(num_cams):
+                        start = camera_id * camera_block
+                        end = start + camera_block
+                        channel_weights[:, start:end].scatter_add_(
+                            2,
+                            index_by_cam[:, camera_id].unsqueeze(1).expand(
+                                -1, camera_block, -1
+                            ),
+                            weight_by_cam[:, camera_id].unsqueeze(1).expand(
+                                -1, camera_block, -1
+                            ),
+                        )
+
         bev = bev.view(batch, value_channels, bev_h, bev_w)
         weights = weights.view(batch, 1, bev_h, bev_w)
+        if channel_weights is None:
+            channel_weights = weights
+        else:
+            channel_weights = channel_weights.view(batch, value_channels, bev_h, bev_w)
 
-        return bev, weights
+        return bev, weights, channel_weights
+
+    def camera_coverage(self, points_car, valid):
+        batch, num_cams, _, _, _ = points_car.shape
+        bev_h, bev_w = self.bev_shape
+
+        rows = (points_car[..., 0] - self.x_min) / self.meters_per_pixel
+        y_bev = points_car[..., 1] * self.bev_y_sign
+        cols = (y_bev - self.y_min) / self.meters_per_pixel
+
+        rows = rows.reshape(batch, num_cams, -1)
+        cols = cols.reshape(batch, num_cams, -1)
+        valid = valid.reshape(batch, num_cams, -1)
+
+        coverage = points_car.new_zeros(batch, num_cams, bev_h * bev_w)
+        row0 = torch.floor(rows)
+        col0 = torch.floor(cols)
+
+        for d_row in (0, 1):
+            for d_col in (0, 1):
+                row = row0 + d_row
+                col = col0 + d_col
+                weight = (1.0 - (rows - row).abs()) * (1.0 - (cols - col).abs())
+                inside = (
+                    valid
+                    & (row >= 0)
+                    & (row < bev_h)
+                    & (col >= 0)
+                    & (col < bev_w)
+                    & (weight > 0)
+                )
+
+                index = (row.long() * bev_w + col.long()).clamp(0, bev_h * bev_w - 1)
+                coverage.scatter_add_(2, index, inside.to(coverage.dtype))
+
+        coverage = (coverage > 0).to(points_car.dtype)
+        coverage = coverage.sum(dim=1, keepdim=True)
+        coverage = coverage / max(float(num_cams), 1.0)
+        return coverage.view(batch, 1, bev_h, bev_w)
 
     def _scaled_intrinsics(self, intrinsics, height, width):
         intrinsic = intrinsics[..., :3, :3].clone()
         if self.calibration_image_shape is None:
             return intrinsic
 
-        calib_h, calib_w = self.calibration_image_shape
+        calib_shape = self.calibration_image_shape
+        if (
+            isinstance(calib_shape, (tuple, list))
+            and len(calib_shape) > 0
+            and isinstance(calib_shape[0], (tuple, list))
+        ):
+            shape = intrinsic.new_tensor(self.calibration_image_shape)
+            scale_y = height / shape[:, 0].view(1, -1)
+            scale_x = width / shape[:, 1].view(1, -1)
+            intrinsic[..., 0, 0] *= scale_x
+            intrinsic[..., 0, 2] *= scale_x
+            intrinsic[..., 1, 1] *= scale_y
+            intrinsic[..., 1, 2] *= scale_y
+            return intrinsic
+
+        calib_h, calib_w = calib_shape
         scale_x = width / calib_w
         scale_y = height / calib_h
         intrinsic[..., 0, 0] *= scale_x
@@ -522,7 +615,7 @@ if __name__ == "__main__":
     pixel_step = 1
     depth_min = 0.0
     depth_max = 80.0
-    depth_scale = 0.5
+    depth_scale = 30
     depth_bias = 0.0
     raw_depth_is_inverse = False
     meters_per_pixel = 150.0 / 188.0

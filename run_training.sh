@@ -3,7 +3,7 @@ set -e
 
 python3 training.py \
   --pixel_step 1 \
-  --epochs 6 \
+  --epochs 10 \
   --num_cams 4 \
   --feature_dim 16 \
   --batch_size 4 \
@@ -17,6 +17,9 @@ python3 training.py \
   --projection_lr 1e-4 \
   --mapping_lr 1e-4 \
   --min_lr 1e-5 \
+  --warmup_epochs 2 \
+  --bce_weight 1.0 \
+  --dice_weight 1.0 \
   --weight_decay 1e-4 \
   --ignore_index 255 \
   --log_dir runs/train \
@@ -25,6 +28,8 @@ python3 training.py \
   --submission_dir submission \
   --best_checkpoint runs/train/checkpoints/best.pt \
   --pred_threshold 0.5 \
+  --augment \
+  --use_coverage_map \
   --no_feature_model \
   --no_depth \
   --mixed_precision
