@@ -9,13 +9,17 @@ except ImportError:
 
 
 class ResBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, dilation: int = 1):
         super().__init__()
 
-        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
+        self.conv1 = nn.Conv2d(
+            in_ch, out_ch, 3, padding=dilation, dilation=dilation, bias=False
+        )
         self.norm1 = make_norm(out_ch)
 
-        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(
+            out_ch, out_ch, 3, padding=dilation, dilation=dilation, bias=False
+        )
         self.norm2 = make_norm(out_ch)
 
         self.skip = (
@@ -41,7 +45,7 @@ class ResBlock(nn.Module):
 
 
 class DownBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, num_blocks: int = 2):
         super().__init__()
 
         self.down = nn.Sequential(
@@ -50,18 +54,22 @@ class DownBlock(nn.Module):
             nn.SiLU(),
         )
 
-        self.res = ResBlock(out_ch, out_ch)
+        self.blocks = nn.Sequential(
+            *[ResBlock(out_ch, out_ch) for _ in range(num_blocks)]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.down(x)
-        x = self.res(x)
+        x = self.blocks(x)
         return x
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, skip_ch: int, out_ch: int, num_blocks: int = 2):
         super().__init__()
-        self.res = ResBlock(in_ch + skip_ch, out_ch)
+        blocks = [ResBlock(in_ch + skip_ch, out_ch)]
+        blocks.extend(ResBlock(out_ch, out_ch) for _ in range(num_blocks - 1))
+        self.blocks = nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(
@@ -72,9 +80,35 @@ class UpBlock(nn.Module):
         )
 
         x = torch.cat([x, skip], dim=1)
-        x = self.res(x)
+        x = self.blocks(x)
 
         return x
+
+
+class ContextBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+
+        self.local = ResBlock(channels, channels, dilation=1)
+        self.mid = ResBlock(channels, channels, dilation=2)
+        self.large = ResBlock(channels, channels, dilation=4)
+
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, 1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = torch.cat(
+            [
+                self.local(x),
+                self.mid(x),
+                self.large(x),
+            ],
+            dim=1,
+        )
+        return self.fuse(y)
 
 
 class BEVSegNet(nn.Module):
@@ -88,13 +122,19 @@ class BEVSegNet(nn.Module):
             ResBlock(base_ch, base_ch),
         )
 
-        self.enc1 = DownBlock(base_ch, base_ch * 2)
-        self.enc2 = DownBlock(base_ch * 2, base_ch * 4)
+        self.enc1 = DownBlock(base_ch, base_ch * 2, num_blocks=2)
+        self.enc2 = DownBlock(base_ch * 2, base_ch * 4, num_blocks=2)
+        self.enc3 = DownBlock(base_ch * 4, base_ch * 4, num_blocks=2)
 
-        self.bottleneck = ResBlock(base_ch * 4, base_ch * 4)
+        self.context = ContextBlock(base_ch * 4)
+        self.bottleneck = nn.Sequential(
+            ResBlock(base_ch * 4, base_ch * 4),
+            ResBlock(base_ch * 4, base_ch * 4, dilation=2),
+        )
 
-        self.dec1 = UpBlock(base_ch * 4, base_ch * 2, base_ch * 2)
-        self.dec0 = UpBlock(base_ch * 2, base_ch, base_ch)
+        self.dec2 = UpBlock(base_ch * 4, base_ch * 4, base_ch * 4, num_blocks=2)
+        self.dec1 = UpBlock(base_ch * 4, base_ch * 2, base_ch * 2, num_blocks=2)
+        self.dec0 = UpBlock(base_ch * 2, base_ch, base_ch, num_blocks=2)
 
         self.head = nn.Sequential(
             ResBlock(base_ch, base_ch),
@@ -107,9 +147,12 @@ class BEVSegNet(nn.Module):
         x0 = self.stem(x)  # [B, 32, 188, 126]
         x1 = self.enc1(x0)  # [B, 64, 94, 63]
         x2 = self.enc2(x1)  # [B, 128, 47, 32]
+        x3 = self.enc3(x2)  # [B, 64, 24, 16] for base_ch=16
 
-        y = self.bottleneck(x2)
+        y = self.context(x3)
+        y = self.bottleneck(y)
 
+        y = self.dec2(y, x2)  # [B, 128, 47, 32]
         y = self.dec1(y, x1)  # [B, 64, 94, 63]
         y = self.dec0(y, x0)  # [B, 32, 188, 126]
 

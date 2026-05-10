@@ -43,6 +43,7 @@ class DepthToBEVProjection(nn.Module):
         inverse_depth_eps=1e-6,
         extrinsics_are_car_to_cam=True,
         bev_y_sign=-1.0,
+        ground_z=0.0,
         normalize_features=True,
         calibration_image_shape=CALIBRATION_IMAGE_SHAPE,
     ):
@@ -62,6 +63,7 @@ class DepthToBEVProjection(nn.Module):
         self.inverse_depth_eps = float(inverse_depth_eps)
         self.extrinsics_are_car_to_cam = extrinsics_are_car_to_cam
         self.bev_y_sign = float(bev_y_sign)
+        self.ground_z = float(ground_z)
         self.normalize_features = normalize_features
         self.calibration_image_shape = calibration_image_shape
 
@@ -77,6 +79,7 @@ class DepthToBEVProjection(nn.Module):
         extrinsics,
         pixel_values=None,
         pixel_step=1,
+        use_ground_plane=False,
         return_debug=False,
     ):
         depths = self._stack_camera_tensor(depths)  # [B, 1, H, W]
@@ -94,9 +97,14 @@ class DepthToBEVProjection(nn.Module):
                 device=depths.device, dtype=depths.dtype
             )
 
-        points_car, valid, values, depth = self.unproject_to_car(
-            depths, intrinsics, extrinsics, pixel_values, pixel_step
-        )
+        if use_ground_plane:
+            points_car, valid, values, depth = self.project_to_ground(
+                depths, intrinsics, extrinsics, pixel_values, pixel_step
+            )
+        else:
+            points_car, valid, values, depth = self.unproject_to_car(
+                depths, intrinsics, extrinsics, pixel_values, pixel_step
+            )
         bev, weights = self.splat_to_bev(points_car, valid, values)
 
         if self.normalize_features:
@@ -165,6 +173,62 @@ class DepthToBEVProjection(nn.Module):
         valid = valid & (depth.squeeze(2) > self.min_depth)
 
         return points_car, valid, values, depth
+
+    def project_to_ground(
+        self, depths, intrinsics, extrinsics, pixel_values=None, pixel_step=1
+    ):
+        batch, num_cams, _, height, width = depths.shape
+        values = (
+            torch.ones_like(depths[:, :, :, ::pixel_step, ::pixel_step])
+            if pixel_values is None
+            else pixel_values[:, :, :, ::pixel_step, ::pixel_step]
+        )
+
+        pixels = self._make_pixel_grid(
+            height, width, pixel_step, depths.device, depths.dtype
+        )
+        pixels = pixels.view(1, 1, *pixels.shape)
+
+        intrinsic = self._scaled_intrinsics(intrinsics, height, width)
+        fx = intrinsic[:, :, 0, 0].view(batch, num_cams, 1, 1)
+        fy = intrinsic[:, :, 1, 1].view(batch, num_cams, 1, 1)
+        cx = intrinsic[:, :, 0, 2].view(batch, num_cams, 1, 1)
+        cy = intrinsic[:, :, 1, 2].view(batch, num_cams, 1, 1)
+
+        u = pixels[..., 0]
+        v = pixels[..., 1]
+        x_ray = (u - cx) / fx.clamp_min(1e-6)
+        y_ray = (v - cy) / fy.clamp_min(1e-6)
+        ray_cam = torch.stack([x_ray, y_ray, torch.ones_like(x_ray)], dim=-1)
+
+        cam_to_car = (
+            torch.linalg.inv(extrinsics)
+            if self.extrinsics_are_car_to_cam
+            else extrinsics
+        )
+        rotation = cam_to_car[..., :3, :3]
+        origin = cam_to_car[..., :3, 3].view(batch, num_cams, 1, 1, 3)
+        ray_car = torch.matmul(
+            ray_cam.unsqueeze(-2),
+            rotation[:, :, None, None].transpose(-1, -2),
+        ).squeeze(-2)
+
+        denom = ray_car[..., 2]
+        safe_denom = torch.where(
+            denom.abs() > 1e-6,
+            denom,
+            denom.sign().clamp(min=0.0) * 2e-6 - 1e-6,
+        )
+        depth = (self.ground_z - origin[..., 2]) / safe_denom
+        points_car = origin + depth.unsqueeze(-1) * ray_car
+
+        valid = torch.isfinite(points_car).all(dim=-1)
+        valid = valid & torch.isfinite(depth)
+        valid = valid & (denom.abs() > 1e-6)
+        valid = valid & (depth > self.min_depth)
+        valid = valid & (depth < self.max_depth)
+
+        return points_car, valid, values, depth.unsqueeze(2)
 
     def depth_to_meters(self, depth):
         if self.raw_depth_is_inverse:
@@ -284,6 +348,8 @@ def plot_debug_batch(
     save_path,
     camera_ids=None,
     pixel_step=8,
+    use_ground_plane=False,
+    separate_camera_channels=False,
     max_samples=4,
     max_scatter_points=25000,
 ):
@@ -306,6 +372,28 @@ def plot_debug_batch(
         std = images.new_tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1)
         return (images * std + mean).clamp(0.0, 1.0)
 
+    def make_camera_values(images):
+        if not separate_camera_channels:
+            return images
+
+        batch_size, num_cams, _, height, width = images.shape
+        camera_values = []
+        for camera_id in range(num_cams):
+            value = images.new_zeros(batch_size, num_cams * 3, height, width)
+            start = camera_id * 3
+            value[:, start : start + 3] = images[:, camera_id]
+            camera_values.append(value)
+        return camera_values
+
+    def make_bev_rgb(bev):
+        if bev.shape[0] == 3:
+            return bev.permute(1, 2, 0).clamp(0.0, 1.0)
+        if bev.shape[0] >= len(CAMERA_NAMES) * 3:
+            rgb = bev[: len(CAMERA_NAMES) * 3].view(len(CAMERA_NAMES), 3, *bev.shape[-2:])
+            rgb = rgb.sum(dim=0)
+            return rgb.permute(1, 2, 0).clamp(0.0, 1.0)
+        return bev[:1].repeat(3, 1, 1).permute(1, 2, 0).clamp(0.0, 1.0)
+
     images, depths, intrinsics, car2cams, static_grids = batch
     images = unnormalize(stack_cameras(images))
     depths = stack_cameras(depths)
@@ -316,14 +404,16 @@ def plot_debug_batch(
     camera_ids = resolve_ids(camera_ids)
     camera_names = [CAMERA_NAMES[idx] for idx in camera_ids]
     batch_size = min(images.shape[0], max_samples)
+    pixel_values = make_camera_values(images)
 
     with torch.no_grad():
         debug = projector(
             depths,
             intrinsics,
             car2cams,
-            pixel_values=images,
+            pixel_values=pixel_values,
             pixel_step=pixel_step,
+            use_ground_plane=use_ground_plane,
             return_debug=True,
         )
 
@@ -345,7 +435,12 @@ def plot_debug_batch(
 
         for local_idx, camera_id in enumerate(camera_ids):
             cam_points = points[camera_id][valid[camera_id]]
-            colors = values[camera_id, :3].permute(1, 2, 0)[valid[camera_id]]
+            if separate_camera_channels:
+                start = camera_id * 3
+                colors = values[camera_id, start : start + 3].permute(1, 2, 0)
+            else:
+                colors = values[camera_id, :3].permute(1, 2, 0)
+            colors = colors[valid[camera_id]]
             if cam_points.shape[0] > max_scatter_points:
                 ids = torch.linspace(
                     0, cam_points.shape[0] - 1, max_scatter_points
@@ -369,8 +464,9 @@ def plot_debug_batch(
         axes[row0, 0].grid(True)
         axes[row0, 0].legend(markerscale=12)
 
-        axes[row0, 1].imshow(debug["weights"][sample_idx, 0].cpu() > 0, cmap="gray")
-        axes[row0, 1].set_title("projection occupancy")
+        bev_rgb = make_bev_rgb(debug["bev"][sample_idx].detach().cpu())
+        axes[row0, 1].imshow(bev_rgb)
+        axes[row0, 1].set_title("projection color")
         axes[row0, 1].axis("off")
 
         axes[row0, 2].imshow(gt_grids[sample_idx, 0].cpu(), cmap="viridis")
@@ -432,9 +528,12 @@ if __name__ == "__main__":
     meters_per_pixel = 150.0 / 188.0
     x_min = 0.0
     y_min = None
+    ground_z = 0.0
+    use_ground_plane = True
+    separate_camera_channels = True
     save_path = Path("bev_projection_debug.png")
 
-    dataset = BaseDataset(data_dir, mode="train")
+    dataset = BaseDataset(data_dir, mode="train", use_depth=False, default_depth=1.)
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
@@ -451,6 +550,7 @@ if __name__ == "__main__":
         depth_scale=depth_scale,
         depth_bias=depth_bias,
         raw_depth_is_inverse=raw_depth_is_inverse,
+        ground_z=ground_z,
     )
 
     batch = next(iter(dataloader))
@@ -460,6 +560,8 @@ if __name__ == "__main__":
         save_path,
         camera_ids=debug_cameras,
         pixel_step=pixel_step,
+        use_ground_plane=use_ground_plane,
+        separate_camera_channels=separate_camera_channels,
         max_samples=batch_size,
     )
     print(f"Saved debug figure to {save_path}")

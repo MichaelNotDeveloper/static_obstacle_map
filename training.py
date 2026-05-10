@@ -45,6 +45,20 @@ def get_target(static_grids, device):
     return target.to(device=device, non_blocking=True)
 
 
+def unnormalize_images(images):
+    mean = images.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = images.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    return (images * std + mean).clamp(0.0, 1.0)
+
+
+def make_camera_color_features(images, camera_id, num_cams):
+    rgb = unnormalize_images(images)
+    features = rgb.new_zeros(rgb.shape[0], num_cams * 3, *rgb.shape[-2:])
+    start = camera_id * 3
+    features[:, start : start + 3] = rgb
+    return features
+
+
 def predict_logits(
     batch, feature_model, projection_model, mapping_model, device, args, nograd=False
 ):
@@ -60,9 +74,12 @@ def predict_logits(
         for camera_id in range(args.num_cams):
             image = images[camera_id].to(device=device, non_blocking=True)
             depth = depths[camera_id]
-            img_proc = torch.cat([image, depth], dim=1)
-            with feature_map_autocast(args, device):
-                feature = feature_model(img_proc)
+            if args.use_feature_model:
+                img_proc = torch.cat([image, depth], dim=1) if args.use_depth else image
+                with feature_map_autocast(args, device):
+                    feature = feature_model(img_proc)
+            else:
+                feature = make_camera_color_features(image, camera_id, args.num_cams)
             features.append(feature.float())
 
         bev_features = projection_model(
@@ -71,6 +88,7 @@ def predict_logits(
             car2cams,
             features,
             pixel_step=args.pixel_step,
+            use_ground_plane=not args.use_depth,
         )
         with feature_map_autocast(args, device):
             logits = mapping_model(bev_features)
@@ -109,7 +127,8 @@ def train_batch(
     device,
     args,
 ) -> None:
-    feature_model.train()
+    if feature_model is not None:
+        feature_model.train()
     projection_model.train()
     mapping_model.train()
 
@@ -156,7 +175,8 @@ def val_batch(
     device,
     args,
 ) -> None:
-    feature_model.eval()
+    if feature_model is not None:
+        feature_model.eval()
     projection_model.eval()
     mapping_model.eval()
 
@@ -194,6 +214,8 @@ def make_dataloader(dataset, batch_size, shuffle, num_workers, device):
 
 
 def make_param_group(model, lr):
+    if model is None:
+        return None
     params = [param for param in model.parameters() if param.requires_grad]
     if not params:
         return None
@@ -203,6 +225,8 @@ def make_param_group(model, lr):
 def grad_norm(models):
     total = 0.0
     for model in models:
+        if model is None:
+            continue
         for param in model.parameters():
             if param.grad is None:
                 continue
@@ -212,11 +236,20 @@ def grad_norm(models):
 
 
 def make_models(args, device):
-    feature_model = RoadPixelFeatureNet(
-        4, feature_dim=args.feature_dim, base_ch=args.base_ch_feat
+    in_channels = 4 if args.use_depth else 3
+    feature_model = (
+        RoadPixelFeatureNet(
+            in_channels, feature_dim=args.feature_dim, base_ch=args.base_ch_feat
+        ).to(device)
+        if args.use_feature_model
+        else None
+    )
+    projection_model = DepthToBEVProjection(
+        depth_scale=args.depth_scale,
+        ground_z=args.ground_z,
     ).to(device)
-    projection_model = DepthToBEVProjection(depth_scale=args.depth_scale).to(device)
-    mapping_model = BEVSegNet(in_ch=args.feature_dim, base_ch=args.base_ch_map).to(
+    map_in_ch = args.feature_dim if args.use_feature_model else args.num_cams * 3
+    mapping_model = BEVSegNet(in_ch=map_in_ch, base_ch=args.base_ch_map).to(
         device
     )
     return feature_model, projection_model, mapping_model
@@ -225,7 +258,8 @@ def make_models(args, device):
 def load_checkpoint(checkpoint_path, feature_model, projection_model, mapping_model):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     models = checkpoint["models"]
-    feature_model.load_state_dict(models["feature_model"])
+    if feature_model is not None and "feature_model" in models:
+        feature_model.load_state_dict(models["feature_model"])
     projection_model.load_state_dict(models["projection_model"])
     mapping_model.load_state_dict(models["mapping_model"])
     return checkpoint
@@ -269,7 +303,12 @@ def run_test_predictions(args):
     predicted_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(test_data_dir / "info.csv", output_dir / "info.csv")
 
-    dataset_test = BaseDataset(test_data_dir, mode="test")
+    dataset_test = BaseDataset(
+        test_data_dir,
+        mode="test",
+        use_depth=args.use_depth,
+        default_depth=args.default_depth,
+    )
     test_dataloader = make_dataloader(
         dataset_test, args.batch_size, False, args.num_workers, device
     )
@@ -281,7 +320,8 @@ def run_test_predictions(args):
         mapping_model,
     )
 
-    feature_model.eval()
+    if feature_model is not None:
+        feature_model.eval()
     projection_model.eval()
     mapping_model.eval()
 
@@ -318,8 +358,16 @@ def run_test_predictions(args):
 def run_training(args):
     device = get_device()
     data_dir = Path(args.data_dir)
-    dataset_train = BaseDataset(data_dir / "train/autonomy_yandex_dataset_train")
-    dataset_val = BaseDataset(data_dir / "val/autonomy_yandex_dataset_val")
+    dataset_train = BaseDataset(
+        data_dir / "train/autonomy_yandex_dataset_train",
+        use_depth=args.use_depth,
+        default_depth=args.default_depth,
+    )
+    dataset_val = BaseDataset(
+        data_dir / "val/autonomy_yandex_dataset_val",
+        use_depth=args.use_depth,
+        default_depth=args.default_depth,
+    )
     train_dataloader = make_dataloader(
         dataset_train, args.batch_size, True, args.num_workers, device
     )
@@ -398,6 +446,8 @@ def main():
     parser.add_argument("--base_ch_feat", type=int, default=16)
     parser.add_argument("--base_ch_map", type=int, default=16)
     parser.add_argument("--depth_scale", type=float, default=1.0)
+    parser.add_argument("--ground_z", type=float, default=0.0)
+    parser.add_argument("--default_depth", type=float, default=30.0)
     parser.add_argument("--feat_lr", type=float, default=1e-4)
     parser.add_argument("--projection_lr", type=float, default=1e-4)
     parser.add_argument("--mapping_lr", type=float, default=1e-4)
@@ -415,11 +465,15 @@ def main():
     )
     parser.add_argument("--pred_threshold", type=float, default=0.5)
     parser.add_argument("--skip_test", action="store_true")
+    parser.add_argument("--use_feature_model", dest="use_feature_model", action="store_true")
+    parser.add_argument("--no_feature_model", dest="use_feature_model", action="store_false")
+    parser.add_argument("--use_depth", dest="use_depth", action="store_true")
+    parser.add_argument("--no_depth", dest="use_depth", action="store_false")
     parser.add_argument("--mixed_precision", dest="mixed_precision", action="store_true")
     parser.add_argument(
         "--no_mixed_precision", dest="mixed_precision", action="store_false"
     )
-    parser.set_defaults(mixed_precision=True)
+    parser.set_defaults(mixed_precision=True, use_depth=True, use_feature_model=True)
     args = parser.parse_args()
     run_training(args)
     if not args.skip_test:

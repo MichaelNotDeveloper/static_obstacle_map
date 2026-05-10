@@ -3,5 +3,6 @@ __pycache__/
 .DS_Store
 autonomy_yandex_dataset_train/
 autonomy_yandex_dataset_val/
+autonomy_yandex_dataset_test/
 bev_projection_debug.png
 image_transforms.png

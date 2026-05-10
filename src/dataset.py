@@ -148,12 +148,21 @@ def collate_camera_batch(batch):
 
 
 class BaseDataset(torch.utils.data.Dataset):
-    def __init__(self, data_dir: Path, mode: str = "train"):
+    def __init__(
+        self,
+        data_dir: Path,
+        mode: str = "train",
+        use_depth: bool = True,
+        default_depth: float = 30.0,
+        depth=None,
+    ):
         self.mode = mode
         self.data_dir = Path(data_dir)
+        self.use_depth = use_depth if depth is None else depth
+        self.default_depth = float(default_depth)
         self.resize_transform = get_resize_transform()
         self.transform = get_transforms()
-        self.depth_model = get_depth_model()
+        self.depth_model = get_depth_model() if self.use_depth else None
         self.info = pd.read_csv(self.data_dir / "info.csv", index_col=0)
         self.images_paths = []
         self.intrinsics_paths = []
@@ -202,12 +211,23 @@ class BaseDataset(torch.utils.data.Dataset):
             self.resize_transform(Image.open(img_path).convert("RGB"))
             for img_path in self.images_paths[idx]
         ]
-        depth_outputs = self.depth_model(images, batch_size=len(images))
+        if self.use_depth:
+            depth_outputs = self.depth_model(images, batch_size=len(images))
+            depths = [
+                depth.to(dtype=torch.float32).unsqueeze(0)
+                for depth in depth_outputs
+            ]
+        else:
+            height, width = images[0].height, images[0].width
+            depths = [
+                torch.full(
+                    (1, height, width),
+                    self.default_depth,
+                    dtype=torch.float32,
+                )
+                for _ in images
+            ]
 
-        depths = [
-            depth.to(dtype=torch.float32).unsqueeze(0)
-            for depth in depth_outputs
-        ]
         images = [self.transform(sample) for sample in images]
         intrinsics = [np.load(intr_path) for intr_path in self.intrinsics_paths[idx]]
         car2cams = [np.load(car2cam_path) for car2cam_path in self.car2cam_paths[idx]]

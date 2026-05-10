@@ -11,6 +11,8 @@ python3 training.py \
   --base_ch_feat 16 \
   --base_ch_map 16 \
   --depth_scale 0.5 \
+  --ground_z 0.0 \
+  --default_depth 30.0 \
   --feat_lr 1e-4 \
   --projection_lr 1e-4 \
   --mapping_lr 1e-4 \
@@ -23,4 +25,6 @@ python3 training.py \
   --submission_dir submission \
   --best_checkpoint runs/train/checkpoints/best.pt \
   --pred_threshold 0.5 \
+  --use_feature_model \
+  --use_depth \
   --mixed_precision
