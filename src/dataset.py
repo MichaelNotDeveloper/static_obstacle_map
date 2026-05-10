@@ -38,15 +38,14 @@ GRIDS_NAMES = [
 IMG_SHAPE = (256, 512)
 CALIBRATION_IMAGE_SHAPE = (540, 1024)
 
-from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-
-
 class FastDepthAnythingMeters:
     def __init__(
         self,
         model_id="depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf",
         device=None,
     ):
+        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+
         if device is None:
             if torch.cuda.is_available():
                 device = "cuda"
@@ -191,17 +190,10 @@ class BaseDataset(torch.utils.data.Dataset):
         if path.is_absolute():
             return path
 
-        candidates = []
         if path.parts and path.parts[0] == self.data_dir.name:
-            candidates.append(self.data_dir / Path(*path.parts[1:]))
-        candidates.append(self.data_dir / path)
-        candidates.append(self.data_dir.parent / path)
+            return self.data_dir / Path(*path.parts[1:])
 
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-
-        return candidates[0]
+        return self.data_dir / path
 
     def __len__(self):
         return len(self.info)

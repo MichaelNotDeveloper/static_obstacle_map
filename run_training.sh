@@ -25,6 +25,6 @@ python3 training.py \
   --submission_dir submission \
   --best_checkpoint runs/train/checkpoints/best.pt \
   --pred_threshold 0.5 \
-  --use_feature_model \
-  --use_depth \
+  --no_feature_model \
+  --no_depth \
   --mixed_precision
